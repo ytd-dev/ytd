@@ -38,7 +38,7 @@ from ymd.api import (
     LinkResolver,
 )
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 __author__ = "Yandex Music Downloader Team"
 
 __all__ = [

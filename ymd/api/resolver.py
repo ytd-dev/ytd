@@ -5,10 +5,13 @@
     https://music.yandex.ru/track/123456
     https://music.yandex.ru/album/123456
     https://music.yandex.ru/artist/123456
+    https://music.yandex.ru/artist/123456/tracks    (все треки артиста)
+    https://music.yandex.ru/artist/123456/podcasts  (подкасты артиста)
     https://music.yandex.ru/album/123456/track/789        (трек из альбома)
     https://music.yandex.ru/album/123456/from/disc/track  (номер трека из URL)
     https://music.yandex.ru/playlists/<uuid>              (плейлист по UUID)
     https://music.yandex.ru/playlists/lk.<uuid>           («Мне нравится» — по своему UUID)
+    https://music.yandex.ru/playlists/ar.<uuid>           (автоплейлист треков артиста)
     https://music.yandex.ru/users/<login>/playlists/<kind> (старый формат: числовой kind,
                                                           lk.<uuid> или likes — только свои)
     Чужой плейлист «Мне нравится» доступен по его lk.<uuid>; ссылка вида
@@ -16,38 +19,73 @@
     для чужих лайков у API нет).
 UTM-параметры (?utm_source=...), прочие query и фрагменты (#...) игнорируются.
 HTML-разбор — только крайний fallback, основной путь — официальный API.
+
+Тип распознанного источника (SourceType) определяет шаблон --path-pattern
+по умолчанию (см. filesystem/paths.DEFAULT_PATTERNS) и имя для {playlist}.
 """
 
 import logging
 import re
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, List, Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-from yandex_music import Client, Track, Album, Playlist, Artist
+from yandex_music import Client, Track, Album, Artist, Playlist
 
 from ymd.exceptions import ResolveError
+from ymd.filesystem.paths import SourceType
 
 
-class LikedPlaylist:
-    """Лёгкая обёртка плейлиста «Мне нравится» (у API нет единого объекта)."""
+class TrackListSource:
+    """Готовый список треков без объекта-носителя (треки артиста, лайки)."""
 
-    def __init__(self, tracks: list):
+    def __init__(self, tracks: list, title: str = ''):
         self.tracks = tracks
         self.track_count = len(tracks)
-        self.title = 'Мне нравится'
-        self.owner = {'login': 'liked'}
-        self.kind = 'liked'
+        self.title = title
 
     def __len__(self) -> int:
         return self.track_count
 
 
+class LikedPlaylist(TrackListSource):
+    """Лёгкая обёртка плейлиста «Мне нравится» (у API нет единого объекта)."""
+
+    def __init__(self, tracks: list):
+        super().__init__(tracks, title='Мне нравится')
+        self.owner = {'login': 'liked'}
+        self.kind = 'liked'
+
+
+class AlbumsSource:
+    """Набор альбомов/подкастов артиста (аналог ArtistAlbums)."""
+
+    def __init__(self, albums: list, artist: Optional[Artist] = None):
+        self.albums = albums
+        self.artist = artist
+        self.album_count = len(albums)
+
+    def __len__(self) -> int:
+        return self.album_count
+
+
+@dataclass
+class ResolvedSource:
+    """Источник + его тип (для контекстного шаблона) и имя плейлиста."""
+
+    source: Any
+    source_type: SourceType
+    playlist_title: Optional[str] = None
+
+
 class LinkResolver:
     """
     Разрешает ссылки (или одиночные ID) в объекты Яндекс.Музыки:
-    Track | Album | Artist | Playlist | LikedPlaylist.
+    Track | Album | Artist | Playlist | TrackListSource | AlbumsSource.
+    resolve_source() дополнительно сообщает SourceType — от него зависит
+    шаблон --path-pattern по умолчанию.
     """
 
     def __init__(self, client: Client):
@@ -57,31 +95,35 @@ class LinkResolver:
         self.track_re = re.compile(r'/track(?:/from/[^/]+(?:/[^/]+)?)?/(\d+)')
         self.track_plain_re = re.compile(r'/track/(\d+)')
         self.album_re = re.compile(r'/album/(\d+)')
-        self.artist_re = re.compile(r'/artist/(\d+)')
+        self.artist_re = re.compile(r'/artist/(\d+)(/tracks|/podcasts)?')
         # Старый формат ДО нового: users/<login>/playlists/<kind>
         self.playlist_legacy_re = re.compile(r'/users/([^/]+)/playlists/([^/?#]+)')
         self.playlist_re = re.compile(r'/playlists/([^/?#]+)')
 
     def resolve(self, url_or_id: str) -> Any:
         """
-        Разрешает ссылку или ID в объект Яндекс.Музыки.
+        Разрешает ссылку или ID в объект Яндекс.Музыки (без типа источника).
 
         Args:
             url_or_id: URL вида https://music.yandex.ru/album/123 или числовой ID трека
 
         Returns:
-            Track | Album | Artist | Playlist | LikedPlaylist
+            Track | Album | Artist | Playlist | TrackListSource | AlbumsSource
 
         Raises:
             ResolveError: если ссылку разрешить не удалось.
         """
+        return self.resolve_source(url_or_id).source
+
+    def resolve_source(self, url_or_id: str) -> ResolvedSource:
+        """Разрешает ссылку/ID и определяет тип источника (SourceType)."""
         raw = str(url_or_id).strip()
         if not raw:
             raise ResolveError('Пустая ссылка')
 
         # Одиночный числовой ID
         if raw.isdigit():
-            return self.resolve_track_id(int(raw))
+            return ResolvedSource(self.resolve_track_id(int(raw)), SourceType.TRACK)
 
         # «music.yandex.ru/album/1» без схемы — добавляем https://
         probe = raw if '://' in raw else f'https://{raw}'
@@ -95,23 +137,35 @@ class LinkResolver:
         # Трек (в т.ч. /album/<id>/track/<id>) — проверяем раньше альбома
         match = self.track_plain_re.search(path)
         if match:
-            return self.resolve_track_id(int(match.group(1)))
+            return ResolvedSource(self.resolve_track_id(int(match.group(1))),
+                                  SourceType.TRACK)
 
         # Альбом
         match = self.album_re.search(path)
         if match:
-            return self.resolve_album_id(int(match.group(1)))
+            return ResolvedSource(self.resolve_album_id(int(match.group(1))),
+                                  SourceType.ALBUM)
 
-        # Исполнитель
+        # Исполнитель: дискография, треки (/tracks) или подкасты (/podcasts)
         match = self.artist_re.search(path)
         if match:
-            return self.resolve_artist_id(int(match.group(1)))
+            artist_id = int(match.group(1))
+            suffix = (match.group(2) or '').strip('/')
+            if suffix == 'tracks':
+                return ResolvedSource(self._resolve_artist_tracks(artist_id),
+                                      SourceType.ARTIST_TRACKS)
+            if suffix == 'podcasts':
+                return ResolvedSource(self._resolve_artist_podcasts(artist_id),
+                                      SourceType.ARTIST_PODCASTS)
+            return ResolvedSource(self.resolve_artist_id(artist_id),
+                                  SourceType.ARTIST_DISCOGRAPHY)
 
         # Старый формат плейлиста: users/<login>/playlists/<kind>
         # (важно: раньше общего playlists/-паттерна)
         match = self.playlist_legacy_re.search(path)
         if match:
-            return self._resolve_owner_playlist(match.group(1), match.group(2))
+            return self._as_playlist_resolved(
+                self._resolve_owner_playlist(match.group(1), match.group(2)))
 
         # Новый формат: playlists/<uuid>, в т.ч. playlists/lk.<uuid> и ar.<uuid>
         match = self.playlist_re.search(path)
@@ -121,10 +175,29 @@ class LinkResolver:
             # он резолвится через API как обычный плейлист (client.playlist).
             # Свои лайки возвращает только ключевое слово likes/liked.
             if playlist_id.lower() in ('likes', 'liked'):
-                return self._resolve_liked_playlist()
-            return self._resolve_playlist_uuid(playlist_id)
+                return self._as_playlist_resolved(self._resolve_liked_playlist())
+            # ar.<uuid> — автоплейлист треков артиста: типизируется как треки
+            # артиста (шаблон {artists}/{artists} - {title}, без папки-плейлиста).
+            return self._as_playlist_resolved(
+                self._resolve_playlist_uuid(playlist_id), fallback_id=playlist_id)
 
         raise ResolveError(f"Не удалось распознать ссылку: {url_or_id}")
+
+    @staticmethod
+    def _as_playlist_resolved(playlist: Any, fallback_id: str = '') -> ResolvedSource:
+        """
+        Оборачивает плейлист в ResolvedSource: имя берём из playlist.title
+        (task §3.1: title = playlist.title or 'Плейлист'). Очистка недопустимых
+        символов ФС происходит позже — FileNamer вызывает sanitize_filename
+        для каждого компонента пути.
+        """
+        title = str(getattr(playlist, 'title', '') or '') or 'Плейлист'
+        kind = str(getattr(playlist, 'kind', '') or fallback_id or '')
+        if kind.lower().startswith('ar.'):
+            source_type = SourceType.ARTIST_TRACKS
+        else:
+            source_type = SourceType.PLAYLIST
+        return ResolvedSource(playlist, source_type, playlist_title=title)
 
     # ------------------------------------------------------------------ IDs
 
@@ -162,7 +235,7 @@ class LinkResolver:
             playlist_id: 'likes', UUID плейлиста или 'owner/kind'
 
         Returns:
-            Playlist | LikedPlaylist
+            Playlist | TrackListSource
 
         Raises:
             ResolveError: если плейлист не найден.
@@ -180,6 +253,68 @@ class LinkResolver:
             return self._resolve_owner_playlist(owner, kind)
 
         return self._resolve_playlist_uuid(pid)
+
+    def resolve_playlist_source(self, playlist_id: str) -> ResolvedSource:
+        """Как resolve_playlist, но сообщает тип источника (для шаблона путей)."""
+        pid = str(playlist_id).strip()
+        if not pid:
+            raise ResolveError('Пустой ID плейлиста')
+        if pid.lower() in ('likes', 'liked'):
+            return self._as_playlist_resolved(self._resolve_liked_playlist())
+        return self._as_playlist_resolved(self.resolve_playlist(pid), fallback_id=pid)
+
+    # ------------------------------------------------- Artist tracks/podcasts
+
+    def _resolve_artist_tracks(self, artist_id: int) -> TrackListSource:
+        """
+        Все треки артиста: /artists/<id>/tracks с пагинацией.
+
+        ArtistTracks отдаёт полноценные Track — догружать нечего.
+        """
+        tracks: List[Any] = []
+        page = 0
+        while True:
+            result = self.client.artists_tracks(artist_id, page=page, page_size=100)
+            batch = getattr(result, 'tracks', None) if result is not None else None
+            if not batch:
+                break
+            tracks.extend(batch)
+            pager = getattr(result, 'pager', None)
+            total = getattr(pager, 'total', None) if pager is not None else None
+            if total is None or len(tracks) >= int(total):
+                break
+            page += 1
+        if not tracks:
+            raise ResolveError(f"У артиста {artist_id} нет треков")
+        return TrackListSource(tracks)
+
+    def _resolve_artist_podcasts(self, artist_id: int) -> AlbumsSource:
+        """
+        Подкасты артиста: прямые альбомы артиста с meta_type == 'podcast'.
+
+        Отдельного маршрута /artists/<id>/podcasts у API нет (проверено:
+        not-found), но подкаст-релизы присутствуют в /artists/<id>/direct-albums
+        (meta_type='podcast'). Выпуски таких релизов — обычные треки, и скачиваются
+        тем же путём, что и альбомы.
+        """
+        albums: List[Any] = []
+        fetched = 0
+        page = 0
+        while True:
+            result = self.client.artists_direct_albums(artist_id, page=page, page_size=100)
+            batch = getattr(result, 'albums', None) if result is not None else None
+            if not batch:
+                break
+            fetched += len(batch)
+            albums.extend(a for a in batch if getattr(a, 'meta_type', None) == 'podcast')
+            pager = getattr(result, 'pager', None)
+            total = getattr(pager, 'total', None) if pager is not None else None
+            if total is None or fetched >= int(total):
+                break
+            page += 1
+        if not albums:
+            raise ResolveError(f"У артиста {artist_id} нет подкастов")
+        return AlbumsSource(albums)
 
     def _resolve_id(self, track_id: str) -> Any:
         """Совместимость со старым именем: разрешает числовой ID трека."""

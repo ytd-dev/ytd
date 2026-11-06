@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yandex_music.exceptions
 from yandex_music import Client, Track
@@ -20,12 +20,17 @@ from ymd.core.quality import (
     NATIVE_EXTENSIONS,
     ConversionPlan,
     DownloadQuality,
-    decide_quality,
     describe_available,
+    select_download_info,
 )
 from ymd.exceptions import DownloadError, QualityError
 from ymd.filesystem.naming import FileNamer
-from ymd.filesystem.paths import ensure_directory, get_unique_filename, sanitize_filename
+from ymd.filesystem.paths import (
+    ensure_directory,
+    get_unique_filename,
+    sanitize_filename,
+    select_default_pattern,
+)
 from ymd.metadata.covers import CoverData, CoverDownloader
 from ymd.metadata.lyrics import LyricsDownloader
 from ymd.metadata.tags import TagWriter
@@ -125,43 +130,38 @@ class TrackDownloader:
         self._taken_paths: Dict[str, str] = {}
         # ID альбомов, тома которых уже догрушались (prepare_track_numbers).
         self._fetched_album_ids: set = set()
+        # Название плейлиста-источника для плейсхолдера {playlist}: задаёт
+        # cli/main.py из ResolvedSource.playlist_title (см. api/resolver.py).
+        # Вне плейлистов пусто — {playlist} раскрывается в пустую строку.
+        self.playlist_title: str = ''
 
     # ------------------------------------------------------------- file info
 
-    def _request_codecs(self) -> List[str]:
-        """Список кодеков для запроса в порядке предпочтения."""
-        if self.quality.is_aac:
-            return ['aac', 'he-aac', 'aac-mp4', 'he-aac-mp4']
-        if self.quality.is_mp3_bitrate:
-            return ['mp3', 'aac-mp4', 'he-aac-mp4', 'aac', 'he-aac']
-        # quality == 2: maximum
-        codecs = ['flac', 'flac-mp4', 'mp3', 'aac-mp4', 'he-aac-mp4', 'aac', 'he-aac']
-        if self.config.compatibility_level >= 1:
-            # --compatibility-level 1: максимально совместимый контейнер, FLAC не запрашиваем
-            codecs = [c for c in codecs if not c.startswith('flac')]
-        return codecs
-
-    def fetch_file_info(self, track: Track) -> Optional[Any]:
+    @property
+    def path_pattern(self) -> str:
         """
-        Получает FileDownloadInfo через signed-эндпоинт /get-file-info.
+        Действующий шаблон пути.
+
+        CLI проставляет его контекстно (cli/main._apply_path_pattern) уже после
+        создания загрузчика, поэтому значение читается из config в момент
+        форматирования. Если шаблон не задан вовсе (программу используют как
+        библиотеку), берётся запасной — тот же, что select_default_pattern
+        даёт для неизвестного типа источника (шаблон альбома).
+        """
+        return self.config.path_pattern or select_default_pattern(None)
+
+    def fetch_file_info(self, track: Track) -> Optional[Tuple[Any, ConversionPlan]]:
+        """
+        Селектор потоков трека: делегирует core.quality.select_download_info.
 
         Returns:
-            FileDownloadInfo или None, если файл недоступен.
+            (download_info, ConversionPlan) — выбранный поток для загрузки и
+            структура решения (целевой кодек, битрейт, флаг транскодирования);
+            None, если у трека нет файла.
         """
-        try:
-            file_info = self.client.tracks_file_info(
-                track.id,
-                quality=self.quality.api_quality,
-                codecs=self._request_codecs(),
-                transport='raw',
-            )
-        except yandex_music.exceptions.YandexMusicError as e:
-            logger.error(f"tracks_file_info({track.id}) не удался: {e}")
-            return None
-
-        if not file_info or not file_info.download_info:
-            return None
-        return file_info.download_info
+        return select_download_info(self.client, track, self.quality,
+                                    compatibility_level=self.config.compatibility_level,
+                                    force_mp3=self.config.force_mp3)
 
     # ---------------------------------------------------------------- naming
 
@@ -185,6 +185,7 @@ class TrackDownloader:
             'genre': base['genre'],
             'duration': int((track.duration_ms or 0) // 1000) or None,
             'bitrate': bitrate,
+            'playlist': self.playlist_title,
         }
 
     def _is_already_downloaded(self, full_path: Path) -> bool:
@@ -281,19 +282,18 @@ class TrackDownloader:
             print(f'[{index}/{total}] 🚫 Недоступен: {title_line}')
             return DownloadResult(STATUS_UNAVAILABLE, track=track, message='Трек недоступен')
 
-        # 2. Информация о файле.
+        # 2. Информация о файле + решение о сохранении (селектор потоков v0.0.2:
+        # для 192/256/320 запрашивается и lossless — при наличии FLAC он станет
+        # источником для MP3 запрошенного битрейта).
         # Яндекс отдаёт bitrate уже в кбит/с (64/192/256/320; 0 — lossless).
-        info = self.fetch_file_info(track)
-        if info is None:
+        selection = self.fetch_file_info(track)
+        if selection is None:
             self.unavailable_tracks.append(track)
             print(f'[{index}/{total}] 🚫 Недоступен (API не выдал ссылку): {title_line}')
             return DownloadResult(STATUS_UNAVAILABLE, track=track, message='Нет ссылки на файл')
 
-        bitrate_kbps = int(info.bitrate) if info.bitrate else None
-
-        # 3. Решение о сохранении
-        plan = decide_quality(self.quality, info.codec, bitrate_kbps,
-                              force_mp3=self.config.force_mp3)
+        info, plan = selection
+        bitrate_kbps = plan.source_bitrate
 
         # 4. Путь и skip-existing (до скачивания, чтобы не гонять трафик)
         number = track_number
@@ -301,7 +301,7 @@ class TrackDownloader:
             number = self._global_numbers.get(str(track.id))
         track_info = self._build_track_info(track, bitrate_kbps or plan.target_bitrate,
                                             track_number=number)
-        rel_path = self.namer.format_filename(track_info, self.config.path_pattern,
+        rel_path = self.namer.format_filename(track_info, self.path_pattern,
                                               extension=plan.output_extension)
         rel_path = self._reserve_path(rel_path, str(track.id))
         full_path = Path(self.config.output_dir) / rel_path
@@ -312,12 +312,11 @@ class TrackDownloader:
             return DownloadResult(STATUS_SKIPPED, track=track, path=full_path,
                                   message='Файл уже существует')
 
-        # 5. Прогресс
+        # 5. Прогресс (матрица v0.0.2: lossless-источник подсвечивается отдельно)
         label = describe_available(info.codec, bitrate_kbps)
         print(f'[{index}/{total}] [{label}] Загружается {rel_path}')
         print(f'  API вернул: {plan.source_description()}')
-        print(f'  Будет сохранен с расширением: {plan.output_extension} '
-              f'({plan.reason})')
+        print(f'  {plan.save_action()}: {plan.output_extension} ({plan.reason})')
 
         # 6. Скачивание байтов
         try:

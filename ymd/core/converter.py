@@ -5,7 +5,11 @@
   * ffmpeg проверяется лениво — только когда реально нужна конвертация
     (ошибка «ffmpeg не найден» не должна мешать скачиванию);
   * remux-only (FLAC в MP4 → FLAC) выполняется без перекодирования (-c:a copy);
-  * транскодирование в MP3 идёт с точным целевым битрейтом (-b:a Nk);
+  * транскодирование в MP3 идёт с точным целевым битрейтом CBR
+    (-c:a libmp3lame -b:a Nk), входом может быть любой поток API:
+    AAC/MP3 или lossless FLAC (в том числе FLAC в контейнере MP4);
+    теги исходника переносятся во временный файл (-map_metadata 0),
+    финальные теги поверх пишет metadata/tags.py;
   * сбой конвертации не прерывает загрузку: файл остаётся в исходном формате.
 """
 
@@ -94,9 +98,15 @@ class AudioConverter:
         if plan.remux_only:
             args += ['-map', '0:a:0', '-c:a', 'copy']
         else:
+            # v0.0.2: входом может быть любой поток API — AAC/MP3 или lossless
+            # FLAC (в том числе FLAC в контейнере MP4). libmp3lame с -b:a Nk
+            # даёт ровно CBR; '-map_metadata 0' переносит теги исходника во
+            # временный файл (финальные теги поверх пишет metadata/tags.py).
             args += ['-c:a', 'libmp3lame']
             if plan.target_bitrate:
                 args += ['-b:a', f'{plan.target_bitrate}k']
+            args += ['-map_metadata', '0']
+            logger.info(f'[FFmpeg] Транскодирование: {plan.ffmpeg_action()}')
 
         args += [str(target)]
 

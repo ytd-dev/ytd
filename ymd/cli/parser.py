@@ -15,11 +15,11 @@ from typing import Optional, Sequence, Tuple
 
 from ymd import __version__
 from ymd.config import (
-    DEFAULT_PATH_PATTERN,
     VALID_LYRICS_FORMATS,
     VALID_QUALITIES,
     AppConfig,
 )
+from ymd.filesystem.paths import DEFAULT_PATTERNS, SourceType
 
 # Values accepted by --compatibility-level (1 disables FLAC requests).
 COMPATIBILITY_LEVELS = (0, 1)
@@ -121,9 +121,10 @@ def create_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "qualities: 0 = AAC 64kbps (.m4a), 1 = AAC 192kbps (.m4a),\n"
-            "2 = maximum available (FLAC when possible, MP3 otherwise),\n"
-            "192/256/320 = MP3 at that bitrate, never above the bitrate the API\n"
-            "reports for the track.\n"
+            "2 = maximum available (FLAC remuxed to .flac when possible, MP3 otherwise),\n"
+            "192/256/320 = strict MP3 at that bitrate: if the track has FLAC, the\n"
+            "lossless stream is downloaded and transcoded to MP3 (CBR); a lossy\n"
+            "source is never upscaled above the bitrate the API reports.\n"
             "\n"
             "if --token is absent the YANDEX_MUSIC_TOKEN environment variable\n"
             "is used, then YANDEX_MUSIC_TOKEN from a local .env file or from\n"
@@ -180,7 +181,8 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="{0,1,2,192,256,320}",
         help=(
             "download/conversion quality: 0, 1, 2, 192, 256 or 320 "
-            "(default: 0 = AAC 64kbps)"
+            "(with 192/256/320 a FLAC stream is used as the MP3 source when "
+            "the track has one; default: 0 = AAC 64kbps)"
         ),
     )
     group.add_argument(
@@ -198,15 +200,19 @@ def create_parser() -> argparse.ArgumentParser:
     group.add_argument(
         "--path-pattern",
         dest="path_pattern",
-        default=DEFAULT_PATH_PATTERN,
+        default=None,
         metavar="PATTERN",
         help=(
             "where files land inside --dir, placeholders: {id}, {title}, "
             "{artists}, {artist}, {album}, {album_artist}, {track_number}, "
             "{track_number_padded}, {real_track_number}, "
             "{real_track_number_padded}, {disc_number}, {year}, {genre}, "
-            "{duration}, {bitrate}, {extension}, {extension_no_dot} "
-            f"(default: {DEFAULT_PATH_PATTERN})"
+            "{duration}, {bitrate}, {extension}, {extension_no_dot}, "
+            "{playlist} (default: chosen automatically by source type: "
+            f"track -> '{DEFAULT_PATTERNS[SourceType.TRACK]}', "
+            f"album -> '{DEFAULT_PATTERNS[SourceType.ALBUM]}', "
+            f"artist -> '{DEFAULT_PATTERNS[SourceType.ARTIST_DISCOGRAPHY]}', "
+            f"playlist -> '{DEFAULT_PATTERNS[SourceType.PLAYLIST]}')"
         ),
     )
     group.add_argument(
@@ -215,7 +221,8 @@ def create_parser() -> argparse.ArgumentParser:
         type=_compatibility_level_arg,
         default=0,
         metavar="{0,1}",
-        help="level 1: never request FLAC, quality 2 becomes maximum MP3/AAC (default: 0)",
+        help=("level 1: never request FLAC (neither with quality 2 nor with "
+              "192/256/320) and write ID3v2.3 instead of v2.4 (default: 0)"),
     )
     group.add_argument(
         "--overwrite",

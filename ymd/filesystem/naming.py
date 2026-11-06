@@ -5,7 +5,7 @@
 {id}, {title}, {artists}, {artist}, {album}, {album_artist}, {track_number},
 {track_number_padded}, {real_track_number}, {real_track_number_padded},
 {disc_number}, {year}, {genre}, {duration}, {bitrate},
-{extension}, {extension_no_dot}
+{extension}, {extension_no_dot}, {playlist}
 """
 
 import re
@@ -34,6 +34,7 @@ PLACEHOLDERS = {
     '{bitrate}': 'Битрейт',
     '{extension}': 'Расширение файла (например .mp3)',
     '{extension_no_dot}': 'Расширение файла без точки (например mp3)',
+    '{playlist}': 'Название плейлиста (для источников-плейлистов)',
 }
 
 # Что вырезать из имени при обычном («безопасном») режиме
@@ -200,6 +201,11 @@ class FileNamer:
         result = result.replace('{genre}', _val('genre'))
         result = result.replace('{duration}', _val('duration'))
         result = result.replace('{bitrate}', _val('bitrate'))
+
+        # Название плейлиста: заполняется только для источников-плейлистов
+        # (см. ResolvedSource.playlist_title в api/resolver.py). В остальных
+        # контекстах пустое значение — пустые сегменты пути убираются (_clean_path).
+        result = result.replace('{playlist}', _val('playlist'))
 
         # Расширение (доступно и как {extension}, и как {extension_no_dot}).
         # Значения берутся «как есть»: пустая строка означает, что расширение не нужно.

@@ -3,19 +3,33 @@
 качества и того, что реально вернул Яндекс API.
 
 Значения качества (числовая модель, как в PR8/YMD):
-    0          → AAC 64 кбит/с (.m4a)
-    1          → AAC 192 кбит/с (.m4a)
-    2          → «максимально доступное»: FLAC → .flac; AAC → MP3 (битрейт API);
-                 MP3 → MP3 (битрейт API)
-    192/256/320 → MP3 с указанным битрейтом, но не выше битрейта источника
+    0          → AAC 64 кбит/с (.m4a); с --force-mp3 → MP3 64 кбит/с CBR
+    1          → AAC 192 кбит/с (.m4a); с --force-mp3 → MP3 192 кбит/с CBR
+    2          → «максимально доступное»: FLAC → .flac (ремукс);
+                 AAC/MP3 → .mp3 с битрейтом API (обычно 256)
+    192/256/320 → всегда .mp3:
+                  FLAC-источник  → транскодирование FLAC → MP3 запрошенного битрейта;
+                  AAC/MP3        → MP3 битрейта min(запрошенный, источник),
+                                   апскейла над источником нет
+
+Наличие lossless (FLAC) API опрашивает в режимах 2, 192, 256, 320 — запрос
+/get-file-info идёт с quality=lossless и flac-кодеками. --compatibility-level 1
+FLAC не запрашивает вовсе. Реальный поток выбирает селектор
+core.downloader.TrackDownloader.select_download_info().
 
 --force-mp3 действует только для quality 0/1: вместо .m4a сохраняется MP3
 (64 или 192 кбит/с соответственно).
+
+mode_description() даёт человекочитаемое описание режима для шапки консоли
+(cli/main.py печатает её до начала закачки) — по ней видно, какое качество
+программа применяет на самом деле.
 """
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, List, Optional, Tuple
+
+import yandex_music.exceptions
 
 from ymd.config import MP3_BITRATES, VALID_QUALITIES
 from ymd.exceptions import QualityError
@@ -44,6 +58,9 @@ NATIVE_EXTENSIONS = {
     'he-aac-mp4': '.m4a',
 }
 
+# Кодеки lossless-варианта Яндекса (FLAC в сыром и MP4 контейнере)
+LOSSLESS_CODECS = ('flac', 'flac-mp4')
+
 
 class DownloadQuality:
     """
@@ -61,16 +78,19 @@ class DownloadQuality:
             )
         self.value = value
 
-    @property
-    def api_quality(self) -> str:
-        """Параметр quality для Яндекс API: 'lq', 'nq', 'hq' или 'lossless'."""
-        if self.value in (192, 256, 320):
+    def api_quality(self, compatibility_level: int = 0) -> str:
+        """
+        Параметр quality для подписанного /get-file-info: 'lq', 'nq', 'hq' или 'lossless'.
+
+        Для 192/256/320 (как и для 2) запрашивается 'lossless' — иначе API не
+        сообщит о наличии FLAC-потока и выбрать его для чистой MP3-ссылки
+        нельзя. --compatibility-level 1 lossless не запрашивает никогда.
+        """
+        if self.is_aac:
+            return 'nq' if self.value == 1 else 'lq'
+        if compatibility_level >= 1:
             return 'hq'
-        if self.value == 2:
-            return 'lossless'
-        if self.value == 1:
-            return 'nq'
-        return 'lq'
+        return 'lossless'
 
     @property
     def is_mp3_bitrate(self) -> bool:
@@ -120,7 +140,8 @@ def _get_target_bitrate(requested: Optional[int], available: Optional[int],
         Целевой битрейт из стандартного списка Яндекса.
     """
     if available is None:
-        # API не сообщил битрейт (например для AAC) — берём запрошенный или стандартный
+        # API не сообщил битрейт (например для lossless — битрейт 0/неизвестен):
+        # берём запрошенный или стандартный.
         if requested in MP3_BITRATES:
             return requested
         return default
@@ -140,18 +161,22 @@ def _get_target_bitrate(requested: Optional[int], available: Optional[int],
 @dataclass
 class ConversionPlan:
     """
-    Решение о том, как сохранить скачанный файл.
+    Решение о том, как сохранить скачанный файл (структура решения селектора
+    select_download_info): что качаем, чем и с каким битрейтом сохраняем.
 
     Attributes:
-        should_convert: нужен ли ffmpeg (конвертация или ремукс)
+        should_convert: нужен ли ffmpeg (транскодирование или ремукс) —
+            «флаг необходимости транскодирования»
         output_extension: итоговое расширение ('.flac', '.mp3', '.m4a')
-        target_bitrate: целевой битрейт для MP3-конвертации (или None)
+        target_codec: целевой кодек на выходе ('flac', 'mp3', 'aac')
+        target_bitrate: целевой битрейт для MP3-кодирования (или None)
         remux_only: достаточно переноса потока без перекодирования (-c:a copy)
         source_container/source_codec/source_bitrate: что вернул API
         reason: человекочитаемое объяснение решения
     """
     should_convert: bool = False
     output_extension: str = '.m4a'
+    target_codec: str = ''
     target_bitrate: Optional[int] = None
     remux_only: bool = False
     source_container: str = ''
@@ -164,11 +189,30 @@ class ConversionPlan:
         """True, если итоговый файл — FLAC."""
         return self.output_extension == '.flac'
 
+    @property
+    def is_flac_source(self) -> bool:
+        """True, если API отдал lossless (FLAC в сыром или MP4 контейнере)."""
+        return self.source_codec == 'FLAC'
+
     def source_description(self) -> str:
-        """Строка вида 'контейнер=MP4, кодек=AAC, заявленный битрейт=256'."""
+        """Строка 'lossless FLAC (источник)' для lossless и 'контейнер=MP4 кодек=AAC заявленный битрейт=256' для lossy."""
+        if self.is_flac_source:
+            return 'lossless FLAC (источник)'
         bitrate = self.source_bitrate if self.source_bitrate is not None else 'не указан'
         return (f"контейнер={self.source_container or '?'} "
                 f"кодек={self.source_codec or '?'} заявленный битрейт={bitrate}")
+
+    def save_action(self) -> str:
+        """
+        Формулировка второй сервисной строки консоли.
+
+        FLAC → MP3 — это осознанное транскодирование lossless-источника,
+        о нём сообщаем отдельно («Будет сконвертирован»); во всех остальных
+        случаях — обычное сохранение с расширением по плану.
+        """
+        if self.is_flac_source and self.output_extension == '.mp3':
+            return 'Будет сконвертирован'
+        return 'Будет сохранен с расширением'
 
     def output_label(self) -> str:
         """
@@ -182,18 +226,32 @@ class ConversionPlan:
         bitrate = self.target_bitrate if self.target_bitrate is not None else self.source_bitrate
         return f'{codec} {bitrate}kbps' if bitrate else codec
 
+    def ffmpeg_action(self) -> str:
+        """Строка операции ffmpeg для лога и сообщения об ошибке (без экранирования)."""
+        if self.remux_only:
+            return f'{self.source_codec} в {self.output_extension} без перекодирования'
+        if self.is_flac_source and self.output_extension == '.mp3':
+            return f'FLAC -> MP3 {self.target_bitrate}kbps CBR'
+        source = self.source_codec or '?'
+        codec = self.target_codec or self.output_extension.lstrip('.')
+        bitrate = f' {self.target_bitrate}kbps' if self.target_bitrate else ''
+        return f'{source} -> {codec.upper()}{bitrate}'
+
 
 def decide_quality(quality: DownloadQuality, codec: str, bitrate: Optional[int],
-                   force_mp3: bool = False) -> ConversionPlan:
+                   force_mp3: bool = False, compatibility_level: int = 0) -> ConversionPlan:
     """
     Определяет, как сохранить файл с учётом запрошенного качества и ответа API.
 
-    Правила:
+    Правила (матрица v0.0.2):
       * quality 0/1 → .m4a (AAC 64/192). С --force-mp3 → MP3 64/192 (ffmpeg).
-      * quality 192/256/320 → .mp3 с целевым битрейтом, не выше источника.
+      * quality 192/256/320 → всегда .mp3:
+          FLAC-источник  → MP3 запрошенного битрейта (CBR, через ffmpeg);
+          AAC/MP3        → MP3 битрейта min(запрошенный, источник);
+                           MP3-источник с целевым битрейтом сохраняется как есть.
       * quality 2 («максимум»):
           FLAC-источник  → .flac (ремукс, если контейнер mp4);
-          AAC-источник   → .mp3 с битрейтом API (обычно 256);
+          AAC-источник   → .mp3 с битрейтом API (обязательная конвертация);
           MP3-источник   → .mp3 как есть (битрейт API).
 
     Args:
@@ -201,11 +259,21 @@ def decide_quality(quality: DownloadQuality, codec: str, bitrate: Optional[int],
         codec: кодек из FileDownloadInfo ('flac', 'mp3', 'aac', ...)
         bitrate: битрейт из FileDownloadInfo (None, если API не сообщил)
         force_mp3: флаг --force-mp3 (только для quality 0/1)
+        compatibility_level: --compatibility-level; при >= 1 FLAC игнорируется
+            даже если API вдруг его вернул (запросом мы его не просим)
 
     Returns:
         ConversionPlan с решением и объяснением.
     """
     codec = (codec or '').lower()
+
+    # Двойная защита --compatibility-level 1: запрос без flac-кодеков обычно и
+    # так не отдаёт lossless, но если сервер всё же вернул FLAC — считаем его
+    # lossy-потоком MP4/AAC, чтобы файл не стал FLAC'ом.
+    if compatibility_level >= 1 and codec in LOSSLESS_CODECS:
+        logger.warning('--compatibility-level 1: API вернул FLAC, игнорируем lossless')
+        codec = 'aac'
+
     container, codec_label = FILE_FORMAT_MAPPING.get(codec, ('?', codec.upper() or '?'))
     native_ext = NATIVE_EXTENSIONS.get(codec, '.dat')
 
@@ -218,8 +286,10 @@ def decide_quality(quality: DownloadQuality, codec: str, bitrate: Optional[int],
             # Обычный случай: API отдал AAC в контейнере MP4
             # ('?' — неизвестный кодек, считаем его AAC, как раньше).
             plan.output_extension = '.m4a'
+            plan.target_codec = 'aac'
             if force_mp3:
                 plan.output_extension = '.mp3'
+                plan.target_codec = 'mp3'
                 plan.should_convert = True
                 plan.target_bitrate = target
                 plan.reason = f'--force-mp3: конвертируем в MP3 {target}kbps'
@@ -233,6 +303,7 @@ def decide_quality(quality: DownloadQuality, codec: str, bitrate: Optional[int],
         # и теги не запишутся («not a MP4 file»).
         if force_mp3:
             plan.output_extension = '.mp3'
+            plan.target_codec = 'mp3'
             if codec == 'mp3' and bitrate == target:
                 plan.reason = f'Уже MP3 {target}kbps, перекодирование не требуется'
             else:
@@ -242,33 +313,49 @@ def decide_quality(quality: DownloadQuality, codec: str, bitrate: Optional[int],
             return plan
 
         plan.output_extension = native_ext
+        plan.target_codec = codec_label.lower()
         bitrate_text = f' {bitrate}kbps' if bitrate else ''
         plan.reason = (f'AAC недоступен, API отдал {codec_label}{bitrate_text} — '
                        f'сохраняем как есть')
         return plan
 
     if quality.is_mp3_bitrate:
-        # 192/256/320: всегда MP3, битрейт не выше источника
-        target = _get_target_bitrate(quality.value, bitrate)
+        # 192/256/320: расширение строго .mp3 при любом ответе API
         plan.output_extension = '.mp3'
+        plan.target_codec = 'mp3'
+
+        if codec_label == 'FLAC':
+            # v0.0.2: у трека есть lossless — качаем FLAC и перегоняем в
+            # запрошенный битрейт CBR. Битрейт lossless-потока API не сообщает,
+            # поэтому он не «потолком», а целью является запрошенное значение.
+            target = quality.value if quality.value in MP3_BITRATES else 320
+            plan.target_bitrate = target
+            plan.should_convert = True
+            plan.reason = f'FLAC -> MP3 {target}kbps CBR'
+            return plan
+
+        # Lossy-источник (AAC/MP3): целевой битрейт не выше источника
+        target = _get_target_bitrate(quality.value, bitrate)
         plan.target_bitrate = target
         if codec == 'mp3' and bitrate == target:
+            # Нужный MP3 уже в источнике — сохраняем напрямую, без ffmpeg
             plan.remux_only = False
             plan.should_convert = False
             plan.reason = f'MP3 {target}kbps из источника — сохраняем как есть'
         elif codec == 'mp3':
             # битрейт источника другой — транскодируем точно в target
             plan.should_convert = True
-            plan.reason = (f'MP3 источника {bitrate}kbps → целевой {target}kbps '
+            plan.reason = (f'MP3 {bitrate}kbps -> MP3 {target}kbps '
                            f'(битрейт понижен до доступного)')
         else:
             plan.should_convert = True
-            plan.reason = f'{codec_label} → MP3 {target}kbps'
+            plan.reason = f'{codec_label} -> MP3 {target}kbps'
         return plan
 
     # quality == 2: максимально доступное
     if codec_label == 'FLAC':
         plan.output_extension = '.flac'
+        plan.target_codec = 'flac'
         if native_ext == '.flac':
             plan.reason = 'FLAC из источника — сохраняем как есть'
         else:
@@ -280,18 +367,21 @@ def decide_quality(quality: DownloadQuality, codec: str, bitrate: Optional[int],
     if codec_label == 'MP3':
         target = _get_target_bitrate(None, bitrate)
         plan.output_extension = '.mp3'
+        plan.target_codec = 'mp3'
         plan.target_bitrate = target
         plan.reason = f'MP3 из источника с битрейтом API ({target}kbps)'
         # Поток MP3 можно сохранить без перекодирования
         plan.should_convert = False
         return plan
 
-    # AAC/HE-AAC на quality 2 → MP3 с битрейтом API (обычно 256)
+    # AAC/HE-AAC на quality 2 → обязательный MP3 с битрейтом API (обычно 256),
+    # а не сырой .m4a (матрица v0.0.2)
     target = _get_target_bitrate(None, bitrate)
     plan.output_extension = '.mp3'
+    plan.target_codec = 'mp3'
     plan.target_bitrate = target
     plan.should_convert = True
-    plan.reason = f'AAC → MP3 {target}kbps (битрейт по данным API)'
+    plan.reason = f'AAC -> MP3 {target}kbps (битрейт по данным API)'
     return plan
 
 
@@ -304,3 +394,107 @@ def describe_available(codec: str, bitrate: Optional[int]) -> str:
     if bitrate:
         return f'{codec_label} {bitrate}kbps'
     return codec_label
+
+
+def mode_description(quality, force_mp3: bool = False, compatibility_level: int = 0) -> str:
+    """
+    Человекочитаемое описание режима качества для шапки консоли.
+
+    Строка печатается до начала закачки и показывает **фактическое** качество,
+    с которым программа будет работать: если в консоли видно не то, что
+    набрано в командной строке, значит флаг `-q` до программы не дошёл
+    (чаще всего из-за `&` в ссылке без кавычек — cmd/bash режут команду строку).
+    --recheck этот режим не описывает: там качество не используется.
+
+    Args:
+        quality: одно из 0, 1, 2, 192, 256, 320 (или DownloadQuality)
+        force_mp3: флаг --force-mp3 (действует только для 0/1)
+        compatibility_level: --compatibility-level; при >= 1 FLAC не запрашивается
+
+    Returns:
+        Строка вида '-q 320 → MP3 320kbps CBR (FLAC проверяется; …)'.
+    """
+    q = quality if isinstance(quality, DownloadQuality) else DownloadQuality(quality)
+    compat = '--compatibility-level 1: FLAC не запрашивается'
+
+    if q.is_aac:
+        if force_mp3:
+            return f'-q {q.value} → MP3 {q.aac_bitrate}kbps CBR (--force-mp3)'
+        return f'-q {q.value} → AAC {q.aac_bitrate}kbps, .m4a без конвертации'
+
+    if q.is_mp3_bitrate:
+        if compatibility_level >= 1:
+            return (f'-q {q.value} → MP3 {q.value}kbps CBR, но не выше источника '
+                    f'({compat})')
+        return (f'-q {q.value} → MP3 {q.value}kbps CBR (FLAC проверяется; '
+                f'без FLAC — не выше источника)')
+
+    if compatibility_level >= 1:
+        return (f'-q {q.value} → максимум из MP3/AAC источника в .mp3 '
+                f'(битрейт не выше источника; {compat})')
+    return (f'-q {q.value} → FLAC → .flac (ремукс); без FLAC → .mp3 '
+            f'с битрейтом источника')
+
+
+def request_codecs(quality: DownloadQuality, compatibility_level: int = 0) -> List[str]:
+    """
+    Список кодеков для подписанного запроса /get-file-info (по предпочтению).
+
+    v0.0.2: режимы 192/256/320 запрашивают FLAC наравне с 2 — если lossless
+    есть, он становится источником для чистой MP3 запрошенного битрейта.
+    --compatibility-level 1 flac-кодеки не запрашивает никогда.
+    """
+    if quality.is_aac:
+        return ['aac', 'he-aac', 'aac-mp4', 'he-aac-mp4']
+    codecs = ['flac', 'flac-mp4', 'mp3', 'aac-mp4', 'he-aac-mp4', 'aac', 'he-aac']
+    if compatibility_level >= 1:
+        # максимально совместимый контейнер: FLAC не запрашиваем
+        codecs = [c for c in codecs if c not in LOSSLESS_CODECS]
+    return codecs
+
+
+def select_download_info(client: Any, track: Any, quality: DownloadQuality,
+                         compatibility_level: int = 0,
+                         force_mp3: bool = False) -> Optional[Tuple[Any, ConversionPlan]]:
+    """
+    Селектор потоков (v0.0.2): подписанный /get-file-info + решение о сохранении.
+
+    Для -q 192/256/320 проверяет наличие lossless-потока (FLAC) аналогично
+    режиму 2: если FLAC доступен — он скачивается и перекодируется в MP3
+    запрошенного битрейта; если нет — действует правило min(запрошенный,
+    источник). --compatibility-level 1 игнорирует FLAC в любом режиме.
+
+    Args:
+        client: инициализированный Client Яндекс.Музыки
+        track: трек (объект Track)
+        quality: запрошенное качество
+        compatibility_level: --compatibility-level
+        force_mp3: --force-mp3 (только для quality 0/1)
+
+    Returns:
+        (download_info, ConversionPlan) — выбранный поток для загрузки и
+        структура решения: целевой кодек (plan.target_codec), целевой битрейт
+        (plan.target_bitrate) и флаг транскодирования (plan.should_convert);
+        None, если у трека нет файла.
+    """
+    try:
+        file_info = client.tracks_file_info(
+            track.id,
+            quality=quality.api_quality(compatibility_level),
+            codecs=request_codecs(quality, compatibility_level),
+            transport='raw',
+        )
+    except yandex_music.exceptions.YandexMusicError as e:
+        logger.error(f"tracks_file_info({track.id}) не удался: {e}")
+        return None
+
+    if not file_info or not file_info.download_info:
+        return None
+
+    download_info = file_info.download_info
+    # Яндекс отдаёт bitrate уже в кбит/с (64/192/256/320; 0 — lossless).
+    bitrate_kbps = int(download_info.bitrate) if download_info.bitrate else None
+    plan = decide_quality(quality, download_info.codec, bitrate_kbps,
+                          force_mp3=force_mp3,
+                          compatibility_level=compatibility_level)
+    return download_info, plan

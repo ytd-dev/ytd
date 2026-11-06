@@ -10,7 +10,13 @@ from yandex_music import Album, Artist, ArtistAlbums, Playlist, Track
 
 from ymd import __version__
 from ymd.api.client import create_client_from_config
-from ymd.api.resolver import LinkResolver, LikedPlaylist
+from ymd.api.resolver import (
+    AlbumsSource,
+    LinkResolver,
+    LikedPlaylist,
+    ResolvedSource,
+    TrackListSource,
+)
 from ymd.config import AppConfig
 from ymd.core.downloader import (
     TrackDownloader,
@@ -18,6 +24,7 @@ from ymd.core.downloader import (
     save_tracks_list,
     write_bitrate_report,
 )
+from ymd.core.quality import mode_description
 from ymd.exceptions import (
     APIError,
     AuthenticationError,
@@ -28,6 +35,11 @@ from ymd.exceptions import (
     PathError,
     QualityError,
     ResolveError,
+)
+from ymd.filesystem.paths import (
+    SOURCE_TYPE_LABELS,
+    SourceType,
+    select_default_pattern,
 )
 
 from ymd.cli.parser import parse_args
@@ -103,20 +115,46 @@ def _source_description(config: AppConfig) -> str:
     return ""
 
 
-def _resolve_source(config: AppConfig, client) -> object:
-    """Resolve the configured source into a yandex-music model object."""
+def _resolve_source(config: AppConfig, client) -> ResolvedSource:
+    """
+    Resolve the configured source into a yandex-music model object.
+
+    Возвращает ResolvedSource: объект источника + его тип (для контекстного
+    шаблона --path-pattern) + название плейлиста (для {playlist}).
+    """
     resolver = LinkResolver(client)
     if config.url:
-        return resolver.resolve(config.url)
+        return resolver.resolve_source(config.url)
     if config.track_id is not None:
-        return resolver.resolve_track_id(config.track_id)
+        return ResolvedSource(resolver.resolve_track_id(config.track_id),
+                              SourceType.TRACK)
     if config.album_id is not None:
-        return resolver.resolve_album_id(config.album_id)
+        return ResolvedSource(resolver.resolve_album_id(config.album_id),
+                              SourceType.ALBUM)
     if config.artist_id is not None:
-        return resolver.resolve_artist_id(config.artist_id)
+        return ResolvedSource(resolver.resolve_artist_id(config.artist_id),
+                              SourceType.ARTIST_DISCOGRAPHY)
     if config.playlist_id is not None:
-        return resolver.resolve_playlist(config.playlist_id)
-    return None
+        return resolver.resolve_playlist_source(config.playlist_id)
+    return ResolvedSource(None, SourceType.ALBUM)
+
+
+def _apply_path_pattern(config: AppConfig, resolved: ResolvedSource) -> None:
+    """
+    Контекстный выбор шаблона сохранения (task §3).
+
+    Если пользователь НЕ передал --path-pattern явно (config.path_pattern is
+    None), шаблон берётся из filesystem.paths.DEFAULT_PATTERNS по типу
+    распознанного источника. Явный шаблон пользователя не трогаем.
+    """
+    if config.path_pattern is None:
+        config.path_pattern = select_default_pattern(resolved.source_type)
+        label = SOURCE_TYPE_LABELS.get(resolved.source_type,
+                                       str(resolved.source_type))
+        print(f"Шаблон пути выбран по типу источника ({label}):")
+    else:
+        print("Шаблон пути (указан пользователем):")
+    print(f"  {config.path_pattern}")
 
 
 # ------------------------------------------------------------- collection
@@ -148,6 +186,13 @@ def collect_tracks(source: object, downloader) -> List:
         artist = getattr(source, "artist", None)
         return _tracks_of_albums(
             list(albums), downloader, artist_id=getattr(artist, "id", None)
+        )
+
+    # Подкасты артиста (AlbumsSource): тот же поток, что и дискография.
+    if isinstance(source, AlbumsSource):
+        return _tracks_of_albums(
+            list(source.albums or []), downloader,
+            artist_id=getattr(getattr(source, "artist", None), "id", None),
         )
 
     if isinstance(source, Album):
@@ -224,12 +269,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("=" * 60)
         print(f"Источник: {_source_description(config)}")
         print(f"Каталог: {config.output_dir}")
+        # Качество печатается до закачки: это страховка от ситуаций, когда флаг
+        # -q не дошёл до программы (например ссылка с & без кавычек в cmd/bash —
+        # оболочка режет командную строку, и запуск уходит с -q 0 по умолчанию).
+        quality_note = mode_description(config.quality, config.force_mp3,
+                                        config.compatibility_level)
+        print(f"Качество: {quality_note}")
 
         client = create_client_from_config(config)
         downloader = TrackDownloader(client, config)
 
-        source = _resolve_source(config, client)
-        tracks = collect_tracks(source, downloader)
+        resolved = _resolve_source(config, client)
+        _apply_path_pattern(config, resolved)
+        # {playlist}: название источника-плейлиста прокидывается в загрузчик
+        # (FileNamer очистит недопустимые символы при форматировании пути).
+        downloader.playlist_title = resolved.playlist_title or ''
+
+        tracks = collect_tracks(resolved.source, downloader)
 
         if not tracks:
             print("Не найдено треков.")

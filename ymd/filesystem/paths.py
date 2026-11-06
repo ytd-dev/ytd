@@ -1,13 +1,62 @@
 """
 Утилиты для работы с путями и файлами.
+
+Здесь же — словари шаблонов по умолчанию для каждого типа источника
+(см. task §3: контекстный выбор --path-pattern).
 """
 
 import re
 import unicodedata
+from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from ymd.exceptions import FileSystemError
+
+
+class SourceType(str, Enum):
+    """Тип распознанного источника (определяет LinkResolver, см. api/resolver.py)."""
+
+    TRACK = 'track'                        # одиночный трек (--track-id, /track/<id>)
+    ALBUM = 'album'                        # альбом целиком (--album-id, /album/<id>)
+    ARTIST_DISCOGRAPHY = 'artist_discography'  # дискография артиста (/artist/<id>)
+    ARTIST_TRACKS = 'artist_tracks'        # треки артиста (/artist/<id>/tracks, ar.<uuid>)
+    ARTIST_PODCASTS = 'artist_podcasts'    # подкасты артиста (/artist/<id>/podcasts)
+    PLAYLIST = 'playlist'                  # любой плейлист (UUID, lk., старый формат, likes)
+
+
+# Шаблоны --path-pattern по умолчанию: выбираются по типу источника,
+# когда пользователь НЕ передал --path-pattern явно.
+DEFAULT_PATTERNS = {
+    SourceType.TRACK: "{artists} - {title}",
+    SourceType.ALBUM: "{artists} - {album}/{track_number_padded} {artists} - {title}",
+    SourceType.ARTIST_DISCOGRAPHY: "{artists}/{album}/{track_number_padded} {artists} - {title}",
+    SourceType.ARTIST_TRACKS: "{artists}/{artists} - {title}",
+    SourceType.ARTIST_PODCASTS: "{artists}/{artists} - {title}",
+    SourceType.PLAYLIST: "{playlist}/{artists} - {title}",
+}
+
+# Как печатать тип источника в консоли (сообщение о выбранном шаблоне).
+SOURCE_TYPE_LABELS = {
+    SourceType.TRACK: 'трек',
+    SourceType.ALBUM: 'альбом',
+    SourceType.ARTIST_DISCOGRAPHY: 'дискография артиста',
+    SourceType.ARTIST_TRACKS: 'треки артиста',
+    SourceType.ARTIST_PODCASTS: 'подкасты артиста',
+    SourceType.PLAYLIST: 'плейлист',
+}
+
+
+def select_default_pattern(source_type: Union[SourceType, str]) -> str:
+    """
+    Возвращает шаблон пути по умолчанию для типа источника.
+
+    Неизвестный тип трактуется как альбом (исторически ближайший шаблон v0.0.1).
+    """
+    try:
+        return DEFAULT_PATTERNS[SourceType(source_type)]
+    except (ValueError, KeyError):
+        return DEFAULT_PATTERNS[SourceType.ALBUM]
 
 
 def sanitize_filename(filename: str, replacement: str = '_') -> str:

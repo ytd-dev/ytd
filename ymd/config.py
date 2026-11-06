@@ -2,11 +2,12 @@
 Конфигурация приложения: датакласс настроек и общие константы.
 
 Значения качества (--quality):
-    0          → AAC 64 кбит/с (.m4a)
-    1          → AAC 192 кбит/с (.m4a)
-    2          → «максимально доступное»: FLAC → .flac; AAC → MP3 (битрейт API, обычно 256);
-                 MP3 → MP3 (битрейт API: 320/256/192/160/128)
-    192/256/320 → MP3 с указанным битрейтом, но не выше битрейта источника
+    0          → AAC 64 кбит/с (.m4a); с --force-mp3 → MP3 64 кбит/с CBR
+    1          → AAC 192 кбит/с (.m4a); с --force-mp3 → MP3 192 кбит/с CBR
+    2          → «максимально доступное»: FLAC → .flac (ремукс);
+                 AAC/MP3 → .mp3 с битрейтом API (обычно 256); в .m4a не остаётся
+    192/256/320 → всегда .mp3: есть FLAC → транскодирование FLAC → MP3
+                 запрошенного битрейта (CBR); lossy → min(запрошенный, источник)
 """
 
 from dataclasses import dataclass
@@ -21,16 +22,19 @@ MP3_BITRATES = [320, 256, 192, 160, 128]
 # Допустимые значения --lyrics-format
 VALID_LYRICS_FORMATS = ['NONE', 'TEXT', 'LRC']
 
-# Стандартный шаблон пути для сохраняемых файлов
+# Стандартный шаблон пути (общий запасной; основные — filesystem/paths.DEFAULT_PATTERNS,
+# выбираются по типу источника)
 DEFAULT_PATH_PATTERN = "{artists} - {album}/{track_number_padded} - {title}"
 
-# Поддерживаемые плейсхолдеры --path-pattern (должны совпадать с filesystem/naming.py)
+# Поддерживаемые плейсхолдеры --path-pattern (должны совпадать с filesystem/naming.py
+# и help --path-pattern в cli/parser.py)
 PATH_PLACEHOLDERS = (
     '{id}', '{title}', '{artists}', '{artist}', '{album}', '{album_artist}',
     '{track_number}', '{track_number_padded}',
     '{real_track_number}', '{real_track_number_padded}',
     '{disc_number}', '{year}',
     '{genre}', '{duration}', '{bitrate}', '{extension}', '{extension_no_dot}',
+    '{playlist}',
 )
 
 
@@ -76,7 +80,9 @@ class AppConfig:
 
     # --- Куда сохранять ---
     output_dir: str = '.'
-    path_pattern: str = DEFAULT_PATH_PATTERN
+    # None = шаблон выбирается автоматически по типу источника
+    # (см. filesystem/paths.DEFAULT_PATTERNS); строка — явный шаблон пользователя.
+    path_pattern: Optional[str] = None
     unsafe_path: bool = False
 
     # --- Качество и конвертация ---
